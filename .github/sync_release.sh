@@ -3,7 +3,7 @@
 set -euo pipefail
 
 UPSTREAM_REPO="https://github.com/MiSTer-devel/Arcade-RallyX_MiSTer.git"
-CORE_NAME="Arcade_RallyX"
+CORE_NAME="Arcade-RallyX"
 MAIN_BRANCH="master"
 
 echo "Fetching upstream:"
