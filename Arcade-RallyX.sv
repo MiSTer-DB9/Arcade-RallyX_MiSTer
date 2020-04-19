@@ -67,18 +67,21 @@ module emu
 	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
 	output	USER_OSD,
-	output	USER_MODE,
+	output  [1:0] USER_MODE,
 	input	[7:0] USER_IN,
 	output	[7:0] USER_OUT
 );
 
 assign VGA_F1    = 0;
 
-wire   joy_split, joy_mdsel;
-wire   [5:0] joy_in = {USER_IN[6],USER_IN[3],USER_IN[5],USER_IN[7],USER_IN[1],USER_IN[2]};
-assign USER_OUT  = |status[31:30] ? {3'b111,joy_split,3'b111,joy_mdsel} : '1;
-assign USER_MODE = |status[31:30] ;
-assign USER_OSD  = joydb9md_1[7] & joydb9md_1[5]; // A�adir esto para OSD
+wire         CLK_JOY = CLK_50M;         //Assign clock between 40-50Mhz
+wire   [2:0] JOY_FLAG  = {status[30],status[31],status[29]}; //Assign 3 bits of status (31:29) o (63:61)
+wire         JOY_CLK, JOY_LOAD, JOY_SPLIT, JOY_MDSEL;
+wire   [5:0] JOY_MDIN  = JOY_FLAG[2] ? {USER_IN[6],USER_IN[3],USER_IN[5],USER_IN[7],USER_IN[1],USER_IN[2]} : '1;
+wire         JOY_DATA  = JOY_FLAG[1] ? USER_IN[5] : '1;
+assign       USER_OUT  = JOY_FLAG[2] ? {3'b111,JOY_SPLIT,3'b111,JOY_MDSEL} : JOY_FLAG[1] ? {6'b111111,JOY_CLK,JOY_LOAD} : '1;
+assign       USER_MODE = JOY_FLAG[2:1] ;
+assign       USER_OSD  = joydb_1[10] & joydb_1[6]; // A�adir esto para OSD
 
 
 assign LED_USER  = ioctl_download;
@@ -93,7 +96,8 @@ localparam CONF_STR = {
 	"A.NRALLYX;;",
 
 	"O1,Aspect Ratio,Original,Wide;",
-	"OUV,Serial SNAC DB9MD,Off,1 Player,2 Players;",
+	"OUV,UserIO Joystick,Off,DB9MD,DB15 ;",
+	"OT,UserIO Players, 1 Player,2 Players;",
 "-;",
 	//"OE,Cabinet,Upright,Cocktail;",
 	"O8A,Difficulty,M1,M2,M3,M4,M5,M6,M7,M8;",
@@ -135,39 +139,39 @@ wire  [7:0] ioctl_dout;
 wire [10:0] ps2_key;
 wire [15:0] joystk1_USB, joystk2_USB;
 
-wire [15:0] joystk1 = |status[31:30] ? {
-	joydb9md_1[8] | (joydb9md_1[7] & joydb9md_1[4]),// Mode|Start + B-> 8 * Coin
-	joydb9md_1[11],// _start_2	-> 7 * Z (dummy)
-	joydb9md_1[7], // _start_1	-> 6 * Start
-	joydb9md_1[6], // btn_fire	-> 4 * A
-	joydb9md_1[3], // btn_up	-> 3 * U
-	joydb9md_1[2], // btn_down	-> 2 * D
-	joydb9md_1[1], // btn_left	-> 1 * L
-	joydb9md_1[0], // btn_righ	-> 0 * R 
-	} 
-	: joystk1_USB;
+// CO S2 S1 F1 U D L R 
+wire [31:0] joystk1 = joydb_1ena ? {joydb_1[11]|(joydb_1[10]&joydb_1[5]),joydb_1[9],joydb_1[10],joydb_1[4:0]} : joystk1_USB;
+wire [31:0] joystk2 = joydb_2ena ? {joydb_2[11]|(joydb_2[10]&joydb_2[5]),joydb_2[10],joydb_2[9],joydb_2[4:0]} : joydb_1ena ? joystk1_USB : joystk2_USB;
 
-wire [15:0] joystk2 =  status[31]    ? {
-	joydb9md_2[8] | (joydb9md_2[7] & joydb9md_2[4]),// Mode|Start + B-> 8 * Coin
-	joydb9md_2[7], // _start_2	-> 7 * Start
-	joydb9md_2[11],// _start_1 	-> Z (dummy)
-	joydb9md_2[6], // btn_fire	-> A
-	joydb9md_2[3], // btn_up	-> U
-	joydb9md_2[2], // btn_down	-> D
-	joydb9md_2[1], // btn_left	-> L
-	joydb9md_2[0], // btn_right	-> R 
-	} 
-	: status[30] ? joystk1_USB : joystk2_USB;
+wire [15:0] joydb_1 = JOY_FLAG[2] ? JOYDB9MD_1 : JOY_FLAG[1] ? JOYDB15_1 : '0;
+wire [15:0] joydb_2 = JOY_FLAG[2] ? JOYDB9MD_2 : JOY_FLAG[1] ? JOYDB15_2 : '0;
+wire        joydb_1ena = |JOY_FLAG[2:1]              ;
+wire        joydb_2ena = |JOY_FLAG[2:1] & JOY_FLAG[0];
 
-reg [15:0] joydb9md_1,joydb9md_2;
+//----BA 9876543210
+//----MS ZYXCBAUDLR
+reg [15:0] JOYDB9MD_1,JOYDB9MD_2;
 joy_db9md joy_db9md
 (
-  .clk       ( clk_sys    ), //35-50MHz
-  .joy_split ( joy_split  ),
-  .joy_mdsel ( joy_mdsel  ),
-  .joy_in    ( joy_in     ),
-  .joystick1 ( joydb9md_1 ),
-  .joystick2 ( joydb9md_2 )	  
+  .clk       ( CLK_JOY    ), //40-50MHz
+  .joy_split ( JOY_SPLIT  ),
+  .joy_mdsel ( JOY_MDSEL  ),
+  .joy_in    ( JOY_MDIN   ),
+  .joystick1 ( JOYDB9MD_1 ),
+  .joystick2 ( JOYDB9MD_2 )	  
+);
+
+//----BA 9876543210
+//----LS FEDCBAUDLR
+reg [15:0] JOYDB15_1,JOYDB15_2;
+joy_db15 joy_db15
+(
+  .clk       ( CLK_JOY   ), //48MHz
+  .JOY_CLK   ( JOY_CLK   ),
+  .JOY_DATA  ( JOY_DATA  ),
+  .JOY_LOAD  ( JOY_LOAD  ),
+  .joystick1 ( JOYDB15_1 ),
+  .joystick2 ( JOYDB15_2 )	  
 );
 
 hps_io #(.STRLEN($size(CONF_STR)>>3)) hps_io
@@ -189,7 +193,7 @@ hps_io #(.STRLEN($size(CONF_STR)>>3)) hps_io
 
 	.joystick_0(joystk1_USB),
 	.joystick_1(joystk2_USB),
-	.joy_raw({joydb9md_1[4],joydb9md_1[6],joydb9md_1[3:0]}),
+	.joy_raw(joydb_1[5:0]),
 	.ps2_key(ps2_key)
 );
 
