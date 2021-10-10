@@ -39,6 +39,7 @@ module emu
 
 	input  [11:0] HDMI_WIDTH,
 	input  [11:0] HDMI_HEIGHT,
+	output        HDMI_FREEZE,
 
 `ifdef MISTER_FB
 	// Use framebuffer in DDRAM (USE_FB=1 in qsf)
@@ -158,8 +159,6 @@ module emu
 );
 
 ///////// Default values for ports not used in this core /////////
-
-assign ADC_BUS  = 'Z;
 wire         CLK_JOY = CLK_50M;         //Assign clock between 40-50Mhz
 wire   [2:0] JOY_FLAG  = {status[30],status[31],status[29]}; //Assign 3 bits of status (31:29) o (63:61)
 wire         JOY_CLK, JOY_LOAD, JOY_SPLIT, JOY_MDSEL;
@@ -168,21 +167,21 @@ wire         JOY_DATA  = JOY_FLAG[1] ? USER_IN[5] : '1;
 assign       USER_OUT  = JOY_FLAG[2] ? {3'b111,JOY_SPLIT,3'b111,JOY_MDSEL} : JOY_FLAG[1] ? {6'b111111,JOY_CLK,JOY_LOAD} : '1;
 assign       USER_MODE = JOY_FLAG[2:1] ;
 assign       USER_OSD  = joydb_1[10] & joydb_1[6]; // A�adir esto para OSD
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
-assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;  
+assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 
-assign VGA_F1 = 0;
-assign VGA_SCALER = 0;
+assign VGA_F1    = 0;
+assign VGA_SCALER= 0;
 
 
 assign LED_USER  = ioctl_download;
-assign BUTTONS   = 0;
-assign AUDIO_MIX = 0;
-
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
+assign BUTTONS   = 0;
+assign AUDIO_MIX = 0;
+assign HDMI_FREEZE = 0;
 
 wire [1:0] ar = status[17:16];
 
@@ -201,6 +200,7 @@ localparam CONF_STR = {
 	//"-;",
 	"DIP;",
 "-;",
+	"H1OR,Autosave Hiscores,Off,On;",
 	"P1,Pause options;",
 	"P1OP,Pause when OSD is open,On,Off;",
 	"P1OQ,Dim video after 10s,On,Off;",
@@ -236,9 +236,11 @@ wire [31:0] status;
 wire  [1:0] buttons;
 wire        forced_scandoubler;
 wire [21:0] gamma_bus;
+wire        direct_video;
 
 wire				ioctl_download;
 wire				ioctl_upload;
+wire				ioctl_upload_req;
 wire				ioctl_wr;
 wire	[7:0]		ioctl_index;
 wire	[24:0]	ioctl_addr;
@@ -282,20 +284,21 @@ joy_db15 joy_db15
   .joystick2 ( JOYDB15_2 )	  
 );
 
-hps_io #(.STRLEN($size(CONF_STR)>>3)) hps_io
+hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
-
-	.conf_str(CONF_STR),
 
 	.buttons(buttons),
 	.status(status),
 	.forced_scandoubler(forced_scandoubler),
 	.gamma_bus(gamma_bus),
+	.direct_video(direct_video),
+	.status_menumask({~hs_configured,direct_video}),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_upload(ioctl_upload),
+	.ioctl_upload_req(ioctl_upload_req),
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
@@ -412,38 +415,42 @@ fpga_NRX GameCore (
 
 	.hs_address(hs_address),
 	.hs_data_in(hs_data_in),
-	.hs_data_out(ioctl_din),
-	.hs_write(hs_write),
-	.hs_access(hs_access)
+	.hs_data_out(hs_data_out),
+	.hs_write(hs_write_enable),
+	.hs_access(hs_access_read|hs_access_write)
 );
 
 // HISCORE SYSTEM
 wire [15:0]hs_address;
-wire [7:0]hs_data_in;
-wire hs_write;
-wire hs_access;
+wire [7:0] hs_data_in;
+wire [7:0] hs_data_out;
+wire hs_write_enable;
+wire hs_access_read;
+wire hs_access_write;
 wire hs_pause;
+wire hs_configured;
 
 hiscore #(
 	.HS_ADDRESSWIDTH(16),
-	.HS_SCOREWIDTH(5),
+	.HS_SCOREWIDTH(6),
 	.CFG_ADDRESSWIDTH(2),
 	.CFG_LENGTHWIDTH(2)
 ) hi (
+	.*,
 	.clk(clk_sys),
 	.reset(iRST),
-	.ioctl_upload(ioctl_upload),
-	.ioctl_download(ioctl_download),
-	.ioctl_wr(ioctl_wr),
-	.ioctl_addr(ioctl_addr),
-	.ioctl_dout(ioctl_dout),
-	.ioctl_din(ioctl_din),
-	.ioctl_index(ioctl_index),
+	.paused(pause_cpu),
+	.autosave(status[27]),
 	.ram_address(hs_address),
+	.data_from_ram(hs_data_out),
 	.data_to_ram(hs_data_in),
-	.ram_write(hs_write),
-	.ram_access(hs_access),
-	.pause_cpu(hs_pause)
+	.data_from_hps(ioctl_dout),
+	.data_to_hps(ioctl_din),
+	.ram_write(hs_write_enable),
+	.ram_intent_read(hs_access_read),
+	.ram_intent_write(hs_access_write),
+	.pause_cpu(hs_pause),
+	.configured(hs_configured)
 );
 
 assign POUT = {oPIX[7:6],2'b00,oPIX[5:3],1'b0,oPIX[2:0],1'b0};
@@ -474,19 +481,19 @@ assign VPOS = vcnt;
 
 always @(posedge PCLK) begin
 	case (hcnt)
-		288: begin HBLK <= 1; hcnt <= hcnt+1; end
-		311: begin HSYN <= 0; hcnt <= hcnt+1; end
-		342: begin HSYN <= 1; hcnt <= 471;    end
-		511: begin HBLK <= 0; hcnt <= 0;
+		288: begin HBLK <= 1; hcnt <= hcnt + 9'd1; end
+		311: begin HSYN <= 0; hcnt <= hcnt + 9'd1; end
+		342: begin HSYN <= 1; hcnt <= 9'd471;    end
+		511: begin HBLK <= 0; hcnt <= 9'd0;
 			case (vcnt)
-				223: begin VBLK <= 1; vcnt <= vcnt+1; end
-				226: begin VSYN <= 0; vcnt <= vcnt+1; end
-				233: begin VSYN <= 1; vcnt <= 483;	  end
-				511: begin VBLK <= 0; vcnt <= 0;		  end
-				default: vcnt <= vcnt+1;
+				223: begin VBLK <= 1; vcnt <= vcnt + 9'd1; end
+				226: begin VSYN <= 0; vcnt <= vcnt + 9'd1; end
+				233: begin VSYN <= 1; vcnt <= 9'd483;	  end
+				511: begin VBLK <= 0; vcnt <= 9'd0;		  end
+				default: vcnt <= vcnt + 9'd1;
 			endcase
 		end
-		default: hcnt <= hcnt+1;
+		default: hcnt <= hcnt + 9'd1;
 	endcase
 	oRGB <= (HBLK|VBLK) ? 12'h0 : iRGB;
 end
