@@ -72,7 +72,7 @@ module sys_top
 	output  [5:0] VGA_R,
 	output  [5:0] VGA_G,
 	output  [5:0] VGA_B,
-	inout         VGA_HS,  // VGA_HS is secondary SD card detect when VGA_EN = 1 (inactive)
+	inout         VGA_HS,
 	output		  VGA_VS,
 	input         VGA_EN,  // active low
 
@@ -125,27 +125,22 @@ module sys_top
 );
 
 //////////////////////  Secondary SD  ///////////////////////////////////
-wire SD_CS, SD_CLK, SD_MOSI;
+wire SD_CS, SD_CLK, SD_MOSI, SD_MISO, SD_CD;
 
 `ifndef MISTER_DUAL_SDRAM
-	wire sd_miso = SW[3] | SDIO_DAT[0];
+	assign SD_CD       = mcp_en ? mcp_sdcd : SDCD_SPDIF;
+	assign SD_MISO     = SD_CD | (mcp_en ? SD_SPI_MISO : (VGA_EN | SDIO_DAT[0]));
+	assign SD_SPI_CS   = mcp_en ?  (mcp_sdcd  ? 1'bZ : SD_CS) : (sog & ~cs1 & ~VGA_EN) ? 1'b1 : 1'bZ;
+	assign SD_SPI_CLK  = (~mcp_en | mcp_sdcd) ? 1'bZ : SD_CLK;
+	assign SD_SPI_MOSI = (~mcp_en | mcp_sdcd) ? 1'bZ : SD_MOSI;
+	assign {SDIO_CLK,SDIO_CMD,SDIO_DAT} = av_dis ? 6'bZZZZZZ : (mcp_en | (SDCD_SPDIF & ~SW[2])) ? {vga_g,vga_r,vga_b} : {SD_CLK,SD_MOSI,SD_CS,3'bZZZ};
 `else
-	wire sd_miso = 1;
-`endif
-wire SD_MISO = mcp_sdcd ? sd_miso : SD_SPI_MISO;
-
-`ifndef MISTER_DUAL_SDRAM
-	assign SDIO_DAT[2:1]= 2'bZZ;
-	assign SDIO_DAT[3]  = SW[3] ? 1'bZ  : SD_CS;
-	assign SDIO_CLK     = SW[3] ? 1'bZ  : SD_CLK;
-	assign SDIO_CMD     = SW[3] ? 1'bZ  : SD_MOSI;
-	assign SD_SPI_CS    = mcp_sdcd ? ((~VGA_EN & sog & ~cs1) ? 1'b1 : 1'bZ) : SD_CS;
-`else
+	assign SD_CD       = mcp_sdcd;
+	assign SD_MISO     = mcp_sdcd | SD_SPI_MISO;
 	assign SD_SPI_CS    = mcp_sdcd ? 1'bZ : SD_CS;
-`endif
-
 assign SD_SPI_CLK  = mcp_sdcd ? 1'bZ : SD_CLK;
 assign SD_SPI_MOSI = mcp_sdcd ? 1'bZ : SD_MOSI;
+`endif
 
 //////////////////////  LEDs/Buttons  ///////////////////////////////////
 
@@ -157,36 +152,59 @@ wire led_d =  led_disk[1]  ? ~led_disk[0]  : ~(led_disk[0] | gp_out[29]);
 wire led_u = ~led_user;
 wire led_locked;
 
-`ifndef MISTER_DUAL_SDRAM
-	assign LED_POWER = (SW[3] | led_p) ? 1'bZ : 1'b0;
-	assign LED_HDD   = (SW[3] | led_d) ? 1'bZ : 1'b0;
-	assign LED_USER  = (SW[3] | led_u) ? 1'bZ : 1'b0;
-`endif
-
-//LEDs on main board
+//LEDs on de10-nano board
 assign LED = (led_overtake & led_state) | (~led_overtake & {1'b0,led_locked,1'b0, ~led_p, 1'b0, ~led_d, 1'b0, ~led_u});
-
-wire btn_r, btn_o, btn_u;
-`ifdef MISTER_DUAL_SDRAM
-	assign {btn_r,btn_o,btn_u} = SW[3] ? {mcp_btn[1],mcp_btn[2],mcp_btn[0]} : ~{SDRAM2_DQ[9],SDRAM2_DQ[13],SDRAM2_DQ[11]};
-`else
-	assign {btn_r,btn_o,btn_u} = ~{BTN_RESET,BTN_OSD,BTN_USER} | {mcp_btn[1],mcp_btn[2],mcp_btn[0]};
-`endif
 
 wire [2:0] mcp_btn;
 wire       mcp_sdcd;
+wire       mcp_en;
+wire       mcp_mode;
 mcp23009 mcp23009
 (
 	.clk(FPGA_CLK2_50),
 
 	.btn(mcp_btn),
 	.led({led_p, led_d, led_u}),
-	.sd_cd(mcp_sdcd),
+	.flg_sd_cd(mcp_sdcd),
+	.flg_present(mcp_en),
+	.flg_mode(mcp_mode),
 
 	.scl(IO_SCL),
 	.sda(IO_SDA)
 );
 
+wire io_dig = mcp_en ? mcp_mode : SW[3];
+
+`ifndef MISTER_DUAL_SDRAM
+	wire   av_dis    = io_dig | VGA_EN;
+	assign LED_POWER = av_dis ? 1'bZ : mcp_en ? de1          : led_p ? 1'bZ : 1'b0;
+	assign LED_HDD   = av_dis ? 1'bZ : mcp_en ? (sog & ~cs1) : led_d ? 1'bZ : 1'b0;
+	//assign LED_USER  = av_dis ? 1'bZ : mcp_en ? ~vga_tx_clk  : led_u ? 1'bZ : 1'b0;
+	assign LED_USER  = VGA_TX_CLK;
+	wire   BTN_DIS   = VGA_EN;
+`else
+	wire   BTN_RESET = SDRAM2_DQ[9];
+	wire   BTN_OSD   = SDRAM2_DQ[13];
+	wire   BTN_USER  = SDRAM2_DQ[11];
+	wire   BTN_DIS   = SDRAM2_DQ[15];
+`endif
+
+reg BTN_EN = 0;
+reg [25:0] btn_timeout = 0;
+initial btn_timeout = 0;
+always @(posedge FPGA_CLK2_50) begin
+	reg btn_up = 0;
+	reg btn_en = 0;
+
+	btn_up <= BTN_RESET & BTN_OSD & BTN_USER;
+	if(~reset & btn_up & ~&btn_timeout) btn_timeout <= btn_timeout + 1'd1;
+	btn_en <= ~BTN_DIS;
+	BTN_EN <= &btn_timeout & btn_en;
+end
+
+wire btn_r = (mcp_en | SW[3]) ? mcp_btn[1] : (BTN_EN & ~BTN_RESET);
+wire btn_o = (mcp_en | SW[3]) ? mcp_btn[2] : (BTN_EN & ~BTN_OSD  );
+wire btn_u = (mcp_en | SW[3]) ? mcp_btn[0] : (BTN_EN & ~BTN_USER );
 
 reg btn_user, btn_osd;
 always @(posedge FPGA_CLK2_50) begin
@@ -213,7 +231,7 @@ end
 
 // gp_in[31] = 0 - quick flag that FPGA is initialized (HPS reads 1 when FPGA is not in user mode)
 //                 used to avoid lockups while JTAG loading
-wire [31:0] gp_in = {1'b0, btn_user | btn[1], btn_osd | btn[0], SW[3], 8'd0, io_ver, io_ack, io_wide, io_dout | io_dout_sys};
+wire [31:0] gp_in = {1'b0, btn_user | btn[1], btn_osd | btn[0], io_dig, 8'd0, io_ver, io_ack, io_wide, io_dout | io_dout_sys};
 wire [31:0] gp_out;
 
 wire  [1:0] io_ver = 1; // 0 - obsolete. 1 - optimized HPS I/O. 2,3 - reserved for future.
@@ -268,13 +286,13 @@ cyclonev_hps_interface_mpu_general_purpose h2f_gp
 
 
 reg [15:0] cfg;
-
 reg        cfg_set      = 0;
-wire       vga_fb       = cfg[12] | vga_force_scaler;
 
 `ifdef MISTER_DEBUG_NOHDMI
+	wire    vga_fb       = 0;
 wire       direct_video = 1;
 `else
+	wire    vga_fb       = cfg[12] | vga_force_scaler;
 wire       direct_video = cfg[10];
 `endif
 
@@ -284,7 +302,11 @@ wire       io_osd_vga   = io_ss1 & ~io_ss2;
 `ifndef MISTER_DUAL_SDRAM
 	wire    ypbpr_en     = cfg[5];
 	wire    sog          = cfg[9];
+	`ifdef MISTER_DEBUG_NOHDMI
+		wire vga_scaler   = 0;
+	`else
 	wire    vga_scaler   = cfg[2] | vga_force_scaler;
+`endif
 `endif
 
 reg        cfg_custom_t = 0;
@@ -520,17 +542,6 @@ cyclonev_hps_interface_peripheral_uart uart
 	.txd(uart_txd)
 );
 
-wire aspi_sck,aspi_mosi,aspi_ss,aspi_miso;
-cyclonev_hps_interface_peripheral_spi_master spi
-(
-	.sclk_out(aspi_sck),
-	.txd(aspi_mosi), // mosi
-	.rxd(aspi_miso), // miso
-
-	.ss_0_n(aspi_ss),
-	.ss_in_n(1)
-);
-
 wire [63:0] f2h_irq = {video_sync,HDMI_TX_VS};
 cyclonev_hps_interface_interrupts interrupts
 (
@@ -636,11 +647,13 @@ ddr_svc ddr_svc
 	.ram_write(ram2_write),
 	.ram_bcnt(ram2_bcnt),
 
+`ifndef MISTER_DISABLE_ALSA
 	.ch0_addr(alsa_address),
 	.ch0_burst(1),
 	.ch0_data(alsa_readdata),
 	.ch0_req(alsa_req),
 	.ch0_ready(alsa_ready),
+`endif
 
 	.ch1_addr(pal_addr),
 	.ch1_burst(128),
@@ -1024,13 +1037,11 @@ reg   [5:0] adj_address;
 reg  [31:0] adj_data;
 
 `ifndef MISTER_DEBUG_NOHDMI
-pll_cfg pll_cfg
+	pll_cfg_hdmi pll_cfg_hdmi
 (
 	.mgmt_clk(FPGA_CLK1_50),
 	.mgmt_reset(reset_req),
 	.mgmt_waitrequest(cfg_waitrequest),
-	.mgmt_read(0),
-	.mgmt_readdata(),
 	.mgmt_write(cfg_write),
 	.mgmt_address(cfg_address),
 	.mgmt_writedata(cfg_data),
@@ -1077,11 +1088,8 @@ always @(posedge FPGA_CLK1_50) begin
 	old_wait <= adj_waitrequest;
 	if(old_wait & ~adj_waitrequest & gotd) cfg_ready <= 1;
 end
-
 `else
-
 wire cfg_ready = 1;
-
 `endif
 
 assign HDMI_I2C_SCL = hdmi_scl_en ? 1'b0 : 1'bZ;
@@ -1097,7 +1105,6 @@ cyclonev_hps_interface_peripheral_i2c hdmi_i2c
 );
 
 `ifndef MISTER_DEBUG_NOHDMI
-
 `ifdef MISTER_FB
 reg dis_output;
 always @(posedge clk_hdmi) begin
@@ -1158,10 +1165,10 @@ osd hdmi_osd
 	.vs_out(hdmi_vs_osd),
 	.de_out(hdmi_de_osd)
 );
-`endif
 
 wire hdmi_cs_osd;
 csync csync_hdmi(clk_hdmi, hdmi_hs_osd, hdmi_vs_osd, hdmi_cs_osd);
+`endif
 
 reg [23:0] dv_data;
 reg        dv_hs, dv_vs, dv_de;
@@ -1195,11 +1202,12 @@ always @(posedge clk_vid) begin
 		end
 
 		dv_de1 <= !{hss,dv_hs_osd} && vde;
-		dv_hs1 <= csync_en ? dv_cs_osd : dv_hs_osd;
-		dv_vs1 <= dv_vs_osd;
 	end
 
 	dv_d1  <= dv_data_osd;
+	dv_hs1 <= csync_en ? dv_cs_osd : dv_hs_osd;
+	dv_vs1 <= dv_vs_osd;
+
 	dv_d2  <= dv_d1;
 	dv_de2 <= dv_de1;
 	dv_hs2 <= dv_hs1;
@@ -1271,10 +1279,17 @@ always @(posedge hdmi_tx_clk) begin
 	hdmi_dv_vs   <= dv_vs;
 	hdmi_dv_de   <= dv_de;
 	
+`ifndef MISTER_DEBUG_NOHDMI
 	hs <= (~vga_fb & direct_video) ? hdmi_dv_hs   : (direct_video & csync_en) ? hdmi_cs_osd : hdmi_hs_osd;
 	vs <= (~vga_fb & direct_video) ? hdmi_dv_vs   : hdmi_vs_osd;
 	de <= (~vga_fb & direct_video) ? hdmi_dv_de   : hdmi_de_osd;
 	d  <= (~vga_fb & direct_video) ? hdmi_dv_data : hdmi_data_osd;
+`else
+	hs <= hdmi_dv_hs;
+	vs <= hdmi_dv_vs;
+	de <= hdmi_dv_de;
+	d  <= hdmi_dv_data;
+`endif
 
 	hdmi_out_hs <= hs;
 	hdmi_out_vs <= vs;
@@ -1288,6 +1303,46 @@ assign HDMI_TX_DE = hdmi_out_de;
 assign HDMI_TX_D  = hdmi_out_d;
 
 /////////////////////////  VGA output  //////////////////////////////////
+
+`ifndef MISTER_DUAL_SDRAM
+	wire vga_tx_clk;
+	`ifndef MISTER_DEBUG_NOHDMI
+		cyclonev_clkselect vga_clk_sw
+		( 
+			.clkselect({1'b1, ~vga_fb & ~vga_scaler}),
+			.inclk({clk_vid, hdmi_clk_out, 2'b00}),
+			.outclk(vga_tx_clk)
+		);
+	`else
+		assign vga_tx_clk = clk_vid;
+	`endif
+
+	wire VGA_TX_CLK;
+	altddio_out
+	#(
+		.extend_oe_disable("OFF"),
+		.intended_device_family("Cyclone V"),
+		.invert_output("OFF"),
+		.lpm_hint("UNUSED"),
+		.lpm_type("altddio_out"),
+		.oe_reg("UNREGISTERED"),
+		.power_up_high("OFF"),
+		.width(1)
+	)
+	vgaclk_ddr
+	(
+		.datain_h(1'b0),
+		.datain_l(1'b1),
+		.outclock(vga_tx_clk),
+		.dataout(VGA_TX_CLK),
+		.aclr(~mcp_en & ~av_dis),
+		.aset(1'b0),
+		.oe(~av_dis & (mcp_en | ~led_u)),
+		.outclocken(1'b1),
+		.sclr(1'b0),
+		.sset(1'b0)
+	);
+`endif
 
 wire [23:0] vga_data_sl;
 wire        vga_de_sl, vga_ce_sl, vga_vs_sl, vga_hs_sl;
@@ -1310,7 +1365,7 @@ scanlines #(0) VGA_scanlines
 );
 
 wire [23:0] vga_data_osd;
-wire        vga_vs_osd, vga_hs_osd;
+wire        vga_vs_osd, vga_hs_osd, vga_de_osd;
 osd vga_osd
 (
 	.clk_sys(clk_sys),
@@ -1328,45 +1383,12 @@ osd vga_osd
 
 	.dout(vga_data_osd),
 	.hs_out(vga_hs_osd),
-	.vs_out(vga_vs_osd)
+	.vs_out(vga_vs_osd),
+	.de_out(vga_de_osd)
 );
 
 wire vga_cs_osd;
 csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
-
-`ifndef MISTER_DUAL_SDRAM
-	wire VGA_DISABLE;
-	wire [23:0] vgas_o;
-	wire vgas_hs, vgas_vs, vgas_cs;
-	vga_out vga_scaler_out
-	(
-		.clk(clk_hdmi),
-		.ypbpr_en(ypbpr_en),
-		.hsync(hdmi_hs_osd),
-		.vsync(hdmi_vs_osd),
-		.csync(hdmi_cs_osd),
-		.dout(vgas_o),
-		.din({24{hdmi_de_osd}} & hdmi_data_osd),
-		.hsync_o(vgas_hs),
-		.vsync_o(vgas_vs),
-		.csync_o(vgas_cs)
-	);
-
-	wire [23:0] vga_o, vga_o_t;
-	wire vga_hs, vga_vs, vga_cs, vga_hs_t, vga_vs_t, vga_cs_t;
-	vga_out vga_out
-	(
-		.clk(clk_vid),
-		.ypbpr_en(ypbpr_en),
-		.hsync(vga_hs_osd),
-		.vsync(vga_vs_osd),
-		.csync(vga_cs_osd),
-		.dout(vga_o_t),
-		.din(vga_data_osd),
-		.hsync_o(vga_hs_t),
-		.vsync_o(vga_vs_t),
-		.csync_o(vga_cs_t)
-	);
 
 `ifndef MISTER_DISABLE_YC
 	reg         pal_en;
@@ -1375,7 +1397,7 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 	reg  [16:0] ColorBurst_Range;
 	reg  [39:0] PhaseInc;
 	wire [23:0] yc_o;
-	wire        yc_hs, yc_vs, yc_cs;
+	wire        yc_hs, yc_vs, yc_cs, yc_de;
 
 	yc_out yc_out
 	(
@@ -1387,25 +1409,78 @@ csync csync_vga(clk_vid, vga_hs_osd, vga_vs_osd, vga_cs_osd);
 		.hsync(vga_hs_osd),
 		.vsync(vga_vs_osd),
 		.csync(vga_cs_osd),
+		.de(vga_de_osd),
 		.dout(yc_o),
 		.din(vga_data_osd),
 		.hsync_o(yc_hs),
 		.vsync_o(yc_vs),
-		.csync_o(yc_cs)
+		.csync_o(yc_cs),
+		.de_o(yc_de)
 	);
-	
-	assign {vga_o, vga_hs, vga_vs, vga_cs } = ~yc_en ? {vga_o_t, vga_hs_t, vga_vs_t, vga_cs_t } : {yc_o, yc_hs, yc_vs, yc_cs };
-`else
-	assign {vga_o, vga_hs, vga_vs, vga_cs } =  {vga_o_t, vga_hs_t, vga_vs_t, vga_cs_t } ;
 `endif
 
-	wire cs1 = (vga_fb | vga_scaler) ? vgas_cs : vga_cs;
+`ifndef MISTER_DUAL_SDRAM
+	wire VGA_DISABLE;
+	wire [23:0] vgas_o;
+	wire vgas_hs, vgas_vs, vgas_cs, vgas_de;
+	`ifndef MISTER_DEBUG_NOHDMI
+		vga_out vga_scaler_out
+		(
+			.clk(clk_hdmi),
+			.ypbpr_en(ypbpr_en),
+			.hsync(hdmi_hs_osd),
+			.vsync(hdmi_vs_osd),
+			.csync(hdmi_cs_osd),
+			.de(hdmi_de_osd),
+			.dout(vgas_o),
+			.din({24{hdmi_de_osd}} & hdmi_data_osd),
+			.hsync_o(vgas_hs),
+			.vsync_o(vgas_vs),
+			.csync_o(vgas_cs),
+			.de_o(vgas_de)
+		);
+	`else
+		assign {vgas_o, vgas_hs, vgas_vs, vgas_cs, vgas_de} = 0;
+	`endif
 
-	assign VGA_VS = (VGA_EN | SW[3]) ? 1'bZ      : (((vga_fb | vga_scaler) ? (~vgas_vs ^ VS[12])                         : VGA_DISABLE ? 1'd1 : ~vga_vs) | csync_en);
-	assign VGA_HS = (VGA_EN | SW[3]) ? 1'bZ      :  ((vga_fb | vga_scaler) ? ((csync_en ? ~vgas_cs : ~vgas_hs) ^ HS[12]) : VGA_DISABLE ? 1'd1 : (csync_en ? ~vga_cs : ~vga_hs));
-	assign VGA_R  = (VGA_EN | SW[3]) ? 6'bZZZZZZ :   (vga_fb | vga_scaler) ? vgas_o[23:18]                               : VGA_DISABLE ? 6'd0 : vga_o[23:18];
-	assign VGA_G  = (VGA_EN | SW[3]) ? 6'bZZZZZZ :   (vga_fb | vga_scaler) ? vgas_o[15:10]                               : VGA_DISABLE ? 6'd0 : vga_o[15:10];
-	assign VGA_B  = (VGA_EN | SW[3]) ? 6'bZZZZZZ :   (vga_fb | vga_scaler) ? vgas_o[7:2]                                 : VGA_DISABLE ? 6'd0 : vga_o[7:2]  ;
+	wire [23:0] vga_o, vga_o_t;
+	wire vga_hs, vga_vs, vga_cs, vga_de, vga_hs_t, vga_vs_t, vga_cs_t, vga_de_t;
+	vga_out vga_out
+	(
+		.clk(clk_vid),
+		.ypbpr_en(ypbpr_en),
+		.hsync(vga_hs_osd),
+		.vsync(vga_vs_osd),
+		.csync(vga_cs_osd),
+		.de(vga_de_osd),
+		.dout(vga_o_t),
+		.din(vga_data_osd),
+		.hsync_o(vga_hs_t),
+		.vsync_o(vga_vs_t),
+		.csync_o(vga_cs_t),
+		.de_o(vga_de_t)
+	);
+
+	`ifndef MISTER_DISABLE_YC
+		assign {vga_o, vga_hs, vga_vs, vga_cs, vga_de } = ~yc_en ? {vga_o_t, vga_hs_t, vga_vs_t, vga_cs_t, vga_de_t } : {yc_o, yc_hs, yc_vs, yc_cs, yc_de };
+	`else
+		assign {vga_o, vga_hs, vga_vs, vga_cs, vga_de } =  {vga_o_t, vga_hs_t, vga_vs_t, vga_cs_t, vga_de_t } ;
+	`endif
+
+	wire vgas_en = vga_fb | vga_scaler;
+
+	wire cs1 = vgas_en ? vgas_cs : vga_cs;
+	wire de1 = vgas_en ? vgas_de : vga_de;
+
+	assign VGA_VS = av_dis ? 1'bZ      : ((vgas_en ? (~vgas_vs ^ VS[12])                         : VGA_DISABLE ? 1'd1 : ~vga_vs) | csync_en);
+	assign VGA_HS = av_dis ? 1'bZ      :  (vgas_en ? ((csync_en ? ~vgas_cs : ~vgas_hs) ^ HS[12]) : VGA_DISABLE ? 1'd1 : (csync_en ? ~vga_cs : ~vga_hs));
+	assign VGA_R  = av_dis ? 6'bZZZZZZ :   vgas_en ? vgas_o[23:18]                               : VGA_DISABLE ? 6'd0 : vga_o[23:18];
+	assign VGA_G  = av_dis ? 6'bZZZZZZ :   vgas_en ? vgas_o[15:10]                               : VGA_DISABLE ? 6'd0 : vga_o[15:10];
+	assign VGA_B  = av_dis ? 6'bZZZZZZ :   vgas_en ? vgas_o[7:2]                                 : VGA_DISABLE ? 6'd0 : vga_o[7:2]  ;
+
+	wire [1:0] vga_r  = vgas_en ? vgas_o[17:16] : VGA_DISABLE ? 2'd0 : vga_o[17:16];
+	wire [1:0] vga_g  = vgas_en ? vgas_o[9:8]   : VGA_DISABLE ? 2'd0 : vga_o[9:8];
+	wire [1:0] vga_b  = vgas_en ? vgas_o[1:0]   : VGA_DISABLE ? 2'd0 : vga_o[1:0];
 `endif
 
 reg video_sync = 0;
@@ -1435,14 +1510,14 @@ end
 
 /////////////////////////  Audio output  ////////////////////////////////
 
-assign SDCD_SPDIF =(SW[3] & ~spdif) ? 1'b0 : 1'bZ;
+assign SDCD_SPDIF = (mcp_en & ~spdif) ? 1'b0 : 1'bZ;
 
 `ifndef MISTER_DUAL_SDRAM
 	wire analog_l, analog_r;
 
-	assign AUDIO_SPDIF = SW[3] ? 1'bZ : SW[0] ? HDMI_LRCLK : spdif;
-	assign AUDIO_R     = SW[3] ? 1'bZ : SW[0] ? HDMI_I2S   : analog_r;
-	assign AUDIO_L     = SW[3] ? 1'bZ : SW[0] ? HDMI_SCLK  : analog_l;
+	assign AUDIO_SPDIF = av_dis ? 1'bZ : (SW[0] | mcp_en) ? HDMI_LRCLK : spdif;
+	assign AUDIO_R     = av_dis ? 1'bZ : (SW[0] | mcp_en) ? HDMI_I2S   : analog_r;
+	assign AUDIO_L     = av_dis ? 1'bZ : (SW[0] | mcp_en) ? HDMI_SCLK  : analog_l;
 `endif
 
 assign HDMI_MCLK = clk_audio;
@@ -1478,8 +1553,10 @@ audio_out audio_out
 	.core_l(audio_l),
 	.core_r(audio_r),
 
+`ifndef MISTER_DISABLE_ALSA
 	.alsa_l(alsa_l),
 	.alsa_r(alsa_r),
+`endif
 
 	.i2s_bclk(HDMI_SCLK),
 	.i2s_lrclk(HDMI_LRCLK),
@@ -1491,6 +1568,18 @@ audio_out audio_out
 	.spdif(spdif)
 );
 
+
+`ifndef MISTER_DISABLE_ALSA
+	wire aspi_sck,aspi_mosi,aspi_ss,aspi_miso;
+	cyclonev_hps_interface_peripheral_spi_master spi
+	(
+		.sclk_out(aspi_sck),
+		.txd(aspi_mosi), // mosi
+		.rxd(aspi_miso), // miso
+
+		.ss_0_n(aspi_ss),
+		.ss_in_n(1)
+	);
 
 wire [28:0] alsa_address;
 wire [63:0] alsa_readdata;
@@ -1518,6 +1607,7 @@ alsa alsa
 	.pcm_l(alsa_l),
 	.pcm_r(alsa_r)
 );
+`endif
 
 ////////////////  User I/O (USB 3.0 connector) /////////////////////////
 
@@ -1722,7 +1812,7 @@ emu emu
 	.SDRAM2_nRAS(SDRAM2_nRAS),
 	.SDRAM2_nCAS(SDRAM2_nCAS),
 	.SDRAM2_CLK(SDRAM2_CLK),
-	.SDRAM2_EN(SW[3]),
+	.SDRAM2_EN(io_dig),
 `endif
 
 	.BUTTONS(btn),
@@ -1732,11 +1822,7 @@ emu emu
 	.SD_MOSI(SD_MOSI),
 	.SD_MISO(SD_MISO),
 	.SD_CS(SD_CS),
-`ifdef MISTER_DUAL_SDRAM
-	.SD_CD(mcp_sdcd),
-`else
-	.SD_CD(mcp_sdcd & (SW[0] ? VGA_HS : (SW[3] | SDCD_SPDIF))),
-`endif
+	.SD_CD(SD_CD),
 
 	.UART_CTS(uart_rts),
 	.UART_RTS(uart_cts),
@@ -1767,19 +1853,17 @@ assign sync_out = sync_in ^ pol;
 
 reg pol;
 always @(posedge clk) begin
-	integer pos = 0, neg = 0, cnt = 0;
+	reg [31:0] cnt;
 	reg s1,s2;
 
 	s1 <= sync_in;
 	s2 <= s1;
+	cnt <= s2 ? (cnt - 1) : (cnt + 1);
 
-	if(~s2 & s1) neg <= cnt;
-	if(s2 & ~s1) pos <= cnt;
-
-	cnt <= cnt + 1;
-	if(s2 != s1) cnt <= 0;
-
-	pol <= pos > neg;
+	if(~s2 & s1) begin
+		cnt <= 0;
+		pol <= cnt[31];
+	end
 end
 
 endmodule
